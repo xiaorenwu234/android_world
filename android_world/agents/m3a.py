@@ -1,4 +1,4 @@
-# Copyright 2026 The android_world Authors.
+# Copyright 2024 The android_world Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,12 +15,11 @@
 """A Multimodal Autonomous Agent for Android (M3A)."""
 
 import time
-
-from absl import logging
 from android_world.agents import agent_utils
 from android_world.agents import base_agent
 from android_world.agents import infer
 from android_world.agents import m3a_utils
+from android_world.env import adb_utils
 from android_world.env import interface
 from android_world.env import json_action
 from android_world.env import representation_utils
@@ -43,7 +42,7 @@ PROMPT_PREFIX = (
     '- If you think the task has been completed, finish the task by using the'
     ' status action with complete as goal_status:'
     ' `{{"action_type": "status", "goal_status": "complete"}}`\n'
-    "- If you think the task is not feasible (including cases like you don't"
+    '- If you think the task is not feasible (including cases like you don\'t'
     ' have enough information or can not perform some necessary actions),'
     ' finish by using the `status` action with infeasible as goal_status:'
     ' `{{"action_type": "status", "goal_status": "infeasible"}}`\n'
@@ -334,27 +333,26 @@ def _summarize_prompt(
 class M3A(base_agent.EnvironmentInteractingAgent):
   """M3A which stands for Multimodal Autonomous Agent for Android."""
 
+  # Wait a few seconds for the screen to stablize after executing an action.
+  WAIT_AFTER_ACTION_SECONDS = 2.0
+
   def __init__(
       self,
       env: interface.AsyncEnv,
       llm: infer.MultimodalLlmWrapper,
       name: str = 'M3A',
-      wait_after_action_seconds: float = 2.0,
   ):
-    """Initializes a M3A Agent.
+    """Initializes a RandomAgent.
 
     Args:
       env: The environment.
       llm: The multimodal LLM wrapper.
       name: The agent name.
-      wait_after_action_seconds: Seconds to wait for the screen to stablize
-        after executing an action
     """
     super().__init__(env, name)
     self.llm = llm
     self.history = []
     self.additional_guidelines = None
-    self.wait_after_action_seconds = wait_after_action_seconds
 
   def set_task_guidelines(self, task_guidelines: list[str]) -> None:
     self.additional_guidelines = task_guidelines
@@ -369,26 +367,24 @@ class M3A(base_agent.EnvironmentInteractingAgent):
     step_data = {
         'raw_screenshot': None,
         'before_screenshot_with_som': None,
-        'before_ui_elements': [],
         'after_screenshot_with_som': None,
         'action_prompt': None,
         'action_output': None,
-        'action_output_json': None,
-        'action_reason': None,
         'action_raw_response': None,
         'summary_prompt': None,
         'summary': None,
         'summary_raw_response': None,
     }
-    logging.info('----------step %s----------', str(len(self.history) + 1))
+    print('----------step ' + str(len(self.history) + 1))
 
     state = self.get_post_transition_state()
+    orientation = adb_utils.get_orientation(self.env.controller)
     logical_screen_size = self.env.logical_screen_size
-    orientation = self.env.orientation
-    physical_frame_boundary = self.env.physical_frame_boundary
+    physical_frame_boundary = adb_utils.get_physical_frame_boundary(
+        self.env.controller
+    )
 
     before_ui_elements = state.ui_elements
-    step_data['before_ui_elements'] = before_ui_elements
     before_ui_elements_list = _generate_ui_elements_description_list(
         before_ui_elements, logical_screen_size
     )
@@ -416,7 +412,7 @@ class M3A(base_agent.EnvironmentInteractingAgent):
         self.additional_guidelines,
     )
     step_data['action_prompt'] = action_prompt
-    action_output, is_safe, raw_response = self.llm.predict_mm(
+    action_output, _, raw_response = self.llm.predict_mm(
         action_prompt,
         [
             step_data['raw_screenshot'],
@@ -424,13 +420,15 @@ class M3A(base_agent.EnvironmentInteractingAgent):
         ],
     )
 
-    if is_safe == False:  # pylint: disable=singleton-comparison
-      #  is_safe could be None
-      action_output = f"""Reason: {m3a_utils.TRIGGER_SAFETY_CLASSIFIER}
-Action: {{"action_type": "status", "goal_status": "infeasible"}}"""
-
     if not raw_response:
-      raise RuntimeError('Error calling LLM in action selection phase.')
+      step_data['summary'] = (
+          'Some error occurred calling LLM during action selection phase.'
+      )
+      self.history.append(step_data)
+      return base_agent.AgentInteractionResult(
+          False,
+          step_data,
+      )
     step_data['action_output'] = action_output
     step_data['action_raw_response'] = raw_response
 
@@ -439,7 +437,7 @@ Action: {{"action_type": "status", "goal_status": "infeasible"}}"""
     # If the output is not in the right format, add it to step summary which
     # will be passed to next step and return.
     if (not reason) or (not action):
-      logging.info('Action prompt output is not in the correct format.')
+      print('Action prompt output is not in the correct format.')
       step_data['summary'] = (
           'Output for action selection is not in the correct format, so no'
           ' action is performed.'
@@ -451,18 +449,16 @@ Action: {{"action_type": "status", "goal_status": "infeasible"}}"""
           step_data,
       )
 
-    logging.info('Action: %s', action)
-    logging.info('Reason: %s', reason)
-    step_data['action_reason'] = reason
+    print('Action: ' + action)
+    print('Reason: ' + reason)
 
     try:
       converted_action = json_action.JSONAction(
           **agent_utils.extract_json(action),
       )
-      step_data['action_output_json'] = converted_action
     except Exception as e:  # pylint: disable=broad-exception-caught
-      logging.info('Failed to convert the output to a valid action.')
-      logging.info(str(e))
+      print('Failed to convert the output to a valid action.')
+      print(str(e))
       step_data['summary'] = (
           'Can not parse the output to a valid action. Please make sure to pick'
           ' the action from the list with required parameters (if any) in the'
@@ -475,20 +471,13 @@ Action: {{"action_type": "status", "goal_status": "infeasible"}}"""
           step_data,
       )
 
-    action_index = converted_action.index
-    num_ui_elements = len(before_ui_elements)
     if (
         converted_action.action_type
         in ['click', 'long_press', 'input_text', 'scroll']
-        and action_index is not None
+        and converted_action.index is not None
     ):
-      if action_index >= num_ui_elements:
-        logging.info(
-            'Index out of range, prediction index is %s, but the'
-            ' UI element list only has %d elements.',
-            action_index,
-            num_ui_elements,
-        )
+      if converted_action.index >= len(before_ui_elements):
+        print('Index out of range.')
         step_data['summary'] = (
             'The parameter index is out of range. Remember the index must be in'
             ' the UI element list!'
@@ -499,8 +488,8 @@ Action: {{"action_type": "status", "goal_status": "infeasible"}}"""
       # Add mark to the target element.
       m3a_utils.add_ui_element_mark(
           step_data['raw_screenshot'],
-          before_ui_elements[action_index],
-          action_index,
+          before_ui_elements[converted_action.index],
+          converted_action.index,
           logical_screen_size,
           physical_frame_boundary,
           orientation,
@@ -508,7 +497,7 @@ Action: {{"action_type": "status", "goal_status": "infeasible"}}"""
 
     if converted_action.action_type == 'status':
       if converted_action.goal_status == 'infeasible':
-        logging.info('Agent stopped since it thinks mission impossible.')
+        print('Agent stopped since it thinks mission impossible.')
       step_data['summary'] = 'Agent thinks the request has been completed.'
       self.history.append(step_data)
       return base_agent.AgentInteractionResult(
@@ -517,13 +506,13 @@ Action: {{"action_type": "status", "goal_status": "infeasible"}}"""
       )
 
     if converted_action.action_type == 'answer':
-      logging.info('Agent answered with: %s', converted_action.text)
+      print('Agent answered with: ' + converted_action.text)
 
     try:
       self.env.execute_action(converted_action)
     except Exception as e:  # pylint: disable=broad-exception-caught
-      logging.info('Failed to execute action.')
-      logging.info(str(e))
+      print('Failed to execute action.')
+      print(str(e))
       step_data['summary'] = (
           'Can not execute the action, make sure to select the action with'
           ' the required parameters (if any) in the correct JSON format!'
@@ -533,12 +522,15 @@ Action: {{"action_type": "status", "goal_status": "infeasible"}}"""
           step_data,
       )
 
-    time.sleep(self.wait_after_action_seconds)
+    time.sleep(self.WAIT_AFTER_ACTION_SECONDS)
 
     state = self.env.get_state(wait_to_stabilize=False)
+    orientation = adb_utils.get_orientation(self.env.controller)
     logical_screen_size = self.env.logical_screen_size
-    orientation = self.env.orientation
-    physical_frame_boundary = self.env.physical_frame_boundary
+    physical_frame_boundary = adb_utils.get_physical_frame_boundary(
+        self.env.controller
+    )
+
     after_ui_elements = state.ui_elements
     after_ui_elements_list = _generate_ui_elements_description_list(
         after_ui_elements, logical_screen_size
@@ -568,7 +560,7 @@ Action: {{"action_type": "status", "goal_status": "infeasible"}}"""
         before_ui_elements_list,
         after_ui_elements_list,
     )
-    summary, is_safe, raw_response = self.llm.predict_mm(
+    summary, _, raw_response = self.llm.predict_mm(
         summary_prompt,
         [
             before_screenshot,
@@ -576,19 +568,9 @@ Action: {{"action_type": "status", "goal_status": "infeasible"}}"""
         ],
     )
 
-    if is_safe == False:  # pylint: disable=singleton-comparison
-      #  is_safe could be None
-      summary = """Summary triggered LLM safety classifier."""
-
     if not raw_response:
-      logging.info(
-          'Error calling LLM in summarization phase. This should not'
-          ' happen: %s',
-          summary,
-      )
       step_data['summary'] = (
-          'Some error occurred calling LLM during summarization phase: %s'
-          % summary
+          'Some error occurred calling LLM during summarization phase.'
       )
       self.history.append(step_data)
       return base_agent.AgentInteractionResult(
@@ -598,7 +580,7 @@ Action: {{"action_type": "status", "goal_status": "infeasible"}}"""
 
     step_data['summary_prompt'] = summary_prompt
     step_data['summary'] = f'Action selected: {action}. {summary}'
-    logging.info('Summary: %s', summary)
+    print('Summary: ' + summary)
     step_data['summary_raw_response'] = raw_response
 
     self.history.append(step_data)

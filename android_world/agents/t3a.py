@@ -12,11 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""T3A: Text-only Autonomous Agent for Android."""
+"""T3A: Text-only Autonomous Agent for Android.
 
+Supports two modes:
+1. 'manual' (default): Traditional step-by-step manual loop
+2. 'react_agent': Uses AgentScope ReActAgent with automatic tool calling loop
+"""
+
+import time
+from agentscope.agent import ReActAgent
+from agentscope.formatter import DashScopeChatFormatter, OpenAIChatFormatter
+from agentscope.memory import InMemoryMemory
+from agentscope.message import Msg, TextBlock
+from agentscope.model import ChatModelBase
+from agentscope.tool import Toolkit, ToolResponse
 from android_world.agents import agent_utils
+from android_world.agents import agentscope_config
+from android_world.agents import agentscope_tools
 from android_world.agents import base_agent
-from android_world.agents import infer
 from android_world.agents import m3a_utils
 from android_world.env import adb_utils
 from android_world.env import interface
@@ -270,25 +283,55 @@ def _summarize_prompt(
 
 
 class T3A(base_agent.EnvironmentInteractingAgent):
-  """Text only autonomous agent for Android."""
+  """Text only autonomous agent for Android.
+
+  Uses AgentScope for all LLM inference.
+  """
 
   def __init__(
       self,
       env: interface.AsyncEnv,
-      llm: infer.LlmWrapper,
+      model=None,
+      model_backend: str = "openai",
       name: str = 'T3A',
   ):
-    """Initializes a RandomAgent.
+    """Initializes a T3A Agent.
 
     Args:
       env: The environment.
-      llm: The text only LLM.
+      model: An AgentScope model instance (e.g., OpenAIChatModel,
+        DashScopeChatModel). If None, creates a default OpenAI model.
+      model_backend: Backend identifier ("openai", "dashscope", "gemini").
       name: The agent name.
     """
     super().__init__(env, name)
-    self.llm = llm
+    if model is None:
+      model = agentscope_config.get_model(model_backend=model_backend)
+    self.model = model
+    self.model_backend = model_backend
     self.history = []
     self.additional_guidelines = None
+
+  def _call_model(self, messages):
+    """Call the AgentScope model and return text output.
+
+    Args:
+      messages: List of message dicts in OpenAI-compatible format.
+
+    Returns:
+      Tuple of (text_output, is_safe, raw_response).
+    """
+    try:
+      response = agentscope_config.sync_model_call(
+          self.model, messages
+      )
+      if response.content:
+        text = response.content[0].get("text", "")
+        return text, True, response
+      return "Error: empty response from model.", False, None
+    except Exception as e:  # pylint: disable=broad-exception-caught
+      print(f"Error calling AgentScope model: {e}")
+      return "Error calling LLM", False, None
 
   def reset(self, go_home_on_reset: bool = False):
     super().reset(go_home_on_reset)
@@ -335,8 +378,12 @@ class T3A(base_agent.EnvironmentInteractingAgent):
         self.additional_guidelines,
     )
     step_data['action_prompt'] = action_prompt
-    action_output, is_safe, raw_response = self.llm.predict(
-        action_prompt,
+    messages = agentscope_tools.build_text_messages(
+        system_prompt="",
+        user_text=action_prompt,
+    )
+    action_output, is_safe, raw_response = self._call_model(
+        messages,
     )
 
     if is_safe == False:  # pylint: disable=singleton-comparison
@@ -462,9 +509,11 @@ Action: {{"action_type": "status", "goal_status": "infeasible"}}"""
         after_element_list,
     )
 
-    summary, is_safe, raw_response = self.llm.predict(
-        summary_prompt,
+    messages = agentscope_tools.build_text_messages(
+        system_prompt="",
+        user_text=summary_prompt,
     )
+    summary, is_safe, raw_response = self._call_model(messages)
     if is_safe == False:  # pylint: disable=singleton-comparison
       #  is_safe could be None
       summary = """Summary triggered LLM safety classifier."""

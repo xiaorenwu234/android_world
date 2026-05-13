@@ -15,8 +15,7 @@
 """Setup file for AndroidWorld."""
 
 import os
-
-import pkg_resources
+import importlib.resources
 import setuptools
 from setuptools.command import build_py
 
@@ -44,9 +43,15 @@ class _GenerateProtoFiles(setuptools.Command):
     # dependencies.
     from grpc_tools import protoc  # pylint: disable=g-import-not-at-top
 
-    grpc_protos_include = pkg_resources.resource_filename(
-        'grpc_tools', '_proto'
-    )
+    # Use importlib.resources to get the grpc_tools _proto directory
+    try:
+      # Python 3.9+
+      import importlib.resources as importlib_resources
+      grpc_protos_include = str(importlib_resources.files('grpc_tools').joinpath('_proto'))
+    except AttributeError:
+      # Python 3.7-3.8 fallback
+      import importlib_resources
+      grpc_protos_include = str(importlib_resources.files('grpc_tools').joinpath('_proto'))
 
     for proto_path in _PACKAGE_PROTOS:
       proto_args = [

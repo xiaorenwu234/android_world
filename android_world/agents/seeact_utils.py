@@ -25,7 +25,8 @@ import re
 import string
 from typing import Any
 from absl import logging
-from android_world.agents import infer
+from android_world.agents import agentscope_config
+from android_world.agents import agentscope_tools
 from android_world.env import json_action
 from android_world.env import representation_utils
 from IPython import display
@@ -178,7 +179,7 @@ def create_action_generation_messages_payload(
   Returns:
     JSON input for OpenAI API.
   """
-  base64_image = infer.Gpt4Wrapper.encode_image(image_array)
+  base64_image = agentscope_tools.image_to_base64_url(image_array)
   messages = [
       {
           "role": "system",
@@ -191,7 +192,7 @@ def create_action_generation_messages_payload(
               {
                   "type": "image_url",
                   "image_url": {
-                      "url": f"data:image/jpeg;base64,{base64_image}",
+                      "url": base64_image,
                       "detail": "high",
                   },
               },
@@ -221,7 +222,7 @@ def create_grounding_messages_payload(
   Returns:
     JSON input for OpenAI API.
   """
-  base64_image = infer.Gpt4Wrapper.encode_image(image_array)
+  base64_image = agentscope_tools.image_to_base64_url(image_array)
   messages = [
       {
           "role": "system",
@@ -234,7 +235,7 @@ def create_grounding_messages_payload(
               {
                   "type": "image_url",
                   "image_url": {
-                      "url": f"data:image/jpeg;base64,{base64_image}",
+                      "url": base64_image,
                       "detail": "high",
                   },
               },
@@ -300,36 +301,52 @@ def execute_openai_request(
     temperature: float = 0.0,
     max_tokens: int = 4096,
 ) -> dict[str, Any]:
-  """Executes a request to the OpenAI API with the given JSON input.
+  """Executes a request via AgentScope OpenAIChatModel.
 
   Args:
     messages_payload: The JSON input created for action generation or grounding.
-    model: The model to use for the request.
-    temperature: Temperature setting for GPT's responses.
+    model: The model name to use for the request.
+    temperature: Temperature setting for model responses.
     max_tokens: Max number of output tokens.
 
   Returns:
-    The response from the OpenAI API as a dictionary.
+    The response from the model as a dictionary compatible with OpenAI format.
   """
-  api_key = os.environ["OPENAI_API_KEY"]
-  headers = {
-      "Content-Type": "application/json",
-      "Authorization": f"Bearer {api_key}",
-  }
-  payload = {
-      "model": model,
-      "messages": messages_payload,
-      "temperature": temperature,
-      "max_tokens": max_tokens,
-  }
-
-  response = requests.post(
-      "https://api.openai.com/v1/chat/completions",
-      headers=headers,
-      json=payload,
+  agent_model = agentscope_config.get_model(
+      model_backend="openai",
+      model_name=model,
+      temperature=temperature,
   )
-
-  return response.json()
+  # Override max_tokens via generate_kwargs (already handled by get_model).
+  try:
+    response = agentscope_config.sync_model_call(
+        agent_model, messages_payload
+    )
+    if response.content:
+      text = response.content[0].get("text", "")
+    else:
+      text = ""
+    # Return a dict compatible with the existing response.json() format.
+    return {
+        "choices": [
+            {
+                "message": {
+                    "content": text,
+                },
+            },
+        ],
+    }
+  except Exception as e:  # pylint: disable=broad-exception-caught
+    print(f"Error executing AgentScope request: {e}")
+    return {
+        "choices": [
+            {
+                "message": {
+                    "content": f"Error: {e}",
+                },
+            },
+        ],
+    }
 
 
 @dataclasses.dataclass(frozen=True)

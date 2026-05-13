@@ -15,11 +15,14 @@
 """Some LLM inference interface."""
 
 import abc
+import asyncio
 import base64
+import concurrent.futures
 import io
 import os
 import time
 from typing import Any, Optional
+
 import google.generativeai as genai
 from google.generativeai import types
 from google.generativeai.types import answer_types
@@ -30,8 +33,55 @@ import numpy as np
 from PIL import Image
 import requests
 
+from android_world.agents import agentscope_config
+
 
 ERROR_CALLING_LLM = 'Error calling LLM'
+
+
+def _sync_model_call(model, messages):
+  """Run an AgentScope model call synchronously with fresh coroutine."""
+  async def _call():
+    return await model(messages=messages)
+
+  try:
+    return asyncio.run(_call())
+  except RuntimeError:
+    def _run_in_thread():
+      return asyncio.run(_call())
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+      future = executor.submit(_run_in_thread)
+      return future.result()
+
+
+def _call_agentscope_openai(
+    text_prompt: str,
+    images: list[np.ndarray],
+    model_name: str,
+    temperature: float = 0.0,
+) -> tuple[str, Optional[bool], Any]:
+  """Call OpenAI through AgentScope."""
+  from android_world.agents import agentscope_tools  # pylint: disable=import-outside-toplevel
+  model = agentscope_config.get_model(
+      model_backend="openai",
+      model_name=model_name,
+      temperature=temperature,
+  )
+  messages = agentscope_tools.build_multimodal_messages(
+      system_prompt="",
+      user_text=text_prompt,
+      images=images,
+      backend="openai",
+  )
+  try:
+    response = _sync_model_call(model, messages)
+    if response.content:
+      text = response.content[0].get("text", "")
+      return text, None, response
+    return ERROR_CALLING_LLM, None, None
+  except Exception as e:  # pylint: disable=broad-exception-caught
+    print(f"Error calling AgentScope OpenAI: {e}")
+    return ERROR_CALLING_LLM, None, None
 
 
 def array_to_jpeg_bytes(image: np.ndarray) -> bytes:
@@ -156,31 +206,27 @@ class GeminiGcpWrapper(LlmWrapper, MultimodalLlmWrapper):
       enable_safety_checks: bool = True,
       generation_config: generation_types.GenerationConfigType | None = None,
   ) -> tuple[str, Optional[bool], Any]:
-    counter = self.max_retry
-    retry_delay = 1.0
-    output = None
-    while counter > 0:
-      try:
-        output = self.llm.generate_content(
-            [text_prompt] + [Image.fromarray(image) for image in images],
-            safety_settings=None
-            if enable_safety_checks
-            else SAFETY_SETTINGS_BLOCK_NONE,
-            generation_config=generation_config,
-        )
-        return output.text, True, output
-      except Exception as e:  # pylint: disable=broad-exception-caught
-        counter -= 1
-        print('Error calling LLM, will retry in {retry_delay} seconds')
-        print(e)
-        if counter > 0:
-          # Expo backoff
-          time.sleep(retry_delay)
-          retry_delay *= 2
-
-    if (output is not None) and (not self.is_safe(output)):
-      return ERROR_CALLING_LLM, False, output
-    return ERROR_CALLING_LLM, None, None
+    """Call multimodal LLM via AgentScope GeminiChatModel."""
+    try:
+      model = agentscope_config.get_model(
+          model_backend="gemini",
+          model_name=self.llm.model_name,
+      )
+      from android_world.agents import agentscope_tools  # pylint: disable=import-outside-toplevel
+      messages = agentscope_tools.build_multimodal_messages(
+          system_prompt="",
+          user_text=text_prompt,
+          images=images,
+          backend="gemini",
+      )
+      response = _sync_model_call(model, messages)
+      if response.content:
+        text = response.content[0].get("text", "")
+        return text, True, response
+      return ERROR_CALLING_LLM, None, None
+    except Exception as e:  # pylint: disable=broad-exception-caught
+      print(f"Error calling AgentScope Gemini: {e}")
+      return ERROR_CALLING_LLM, None, None
 
   def generate(
       self,
@@ -241,6 +287,51 @@ class GeminiGcpWrapper(LlmWrapper, MultimodalLlmWrapper):
     return converted
 
 
+class DashScopeWrapper(MultimodalLlmWrapper):
+  """DashScope multimodal wrapper via AgentScope.
+
+  Uses AgentScope DashScopeChatModel as the underlying model caller.
+  Implements the same MultimodalLlmWrapper interface as Gpt4Wrapper so it
+  can be used as a drop-in replacement for the original M3A step loop.
+  """
+
+  def __init__(
+      self,
+      model_name: str = 'qwen-vl-max',
+      temperature: float = 0.0,
+  ):
+    self.model_name = model_name
+    self.temperature = temperature
+
+  def predict_mm(
+      self,
+      text_prompt: str,
+      images: list[np.ndarray],
+  ) -> tuple[str, Optional[bool], Any]:
+    """Call multimodal LLM via AgentScope DashScopeChatModel."""
+    from android_world.agents import agentscope_tools  # pylint: disable=import-outside-toplevel
+    model = agentscope_config.get_model(
+        model_backend='dashscope',
+        model_name=self.model_name,
+        temperature=self.temperature,
+    )
+    messages = agentscope_tools.build_multimodal_messages(
+        system_prompt='',
+        user_text=text_prompt,
+        images=images,
+        backend='dashscope',
+    )
+    try:
+      response = _sync_model_call(model, messages)
+      if response.content:
+        text = response.content[0].get('text', '')
+        return text, None, response
+      return ERROR_CALLING_LLM, None, None
+    except Exception as e:  # pylint: disable=broad-exception-caught
+      print(f'Error calling AgentScope DashScope: {e}')
+      return ERROR_CALLING_LLM, None, None
+
+
 class Gpt4Wrapper(LlmWrapper, MultimodalLlmWrapper):
   """OpenAI GPT4 wrapper.
 
@@ -283,59 +374,10 @@ class Gpt4Wrapper(LlmWrapper, MultimodalLlmWrapper):
   def predict_mm(
       self, text_prompt: str, images: list[np.ndarray]
   ) -> tuple[str, Optional[bool], Any]:
-    headers = {
-        'Content-Type': 'application/json',
-        'Authorization': f'Bearer {self.openai_api_key}',
-    }
-
-    payload = {
-        'model': self.model,
-        'temperature': self.temperature,
-        'messages': [{
-            'role': 'user',
-            'content': [
-                {'type': 'text', 'text': text_prompt},
-            ],
-        }],
-        'max_tokens': 1000,
-    }
-
-    # Gpt-4v supports multiple images, just need to insert them in the content
-    # list.
-    for image in images:
-      payload['messages'][0]['content'].append({
-          'type': 'image_url',
-          'image_url': {
-              'url': f'data:image/jpeg;base64,{self.encode_image(image)}'
-          },
-      })
-
-    counter = self.max_retry
-    wait_seconds = self.RETRY_WAITING_SECONDS
-    while counter > 0:
-      try:
-        response = requests.post(
-            'https://api.openai.com/v1/chat/completions',
-            headers=headers,
-            json=payload,
-        )
-        if response.ok and 'choices' in response.json():
-          return (
-              response.json()['choices'][0]['message']['content'],
-              None,
-              response,
-          )
-        print(
-            'Error calling OpenAI API with error message: '
-            + response.json()['error']['message']
-        )
-        time.sleep(wait_seconds)
-        wait_seconds *= 2
-      except Exception as e:  # pylint: disable=broad-exception-caught
-        # Want to catch all exceptions happened during LLM calls.
-        time.sleep(wait_seconds)
-        wait_seconds *= 2
-        counter -= 1
-        print('Error calling LLM, will retry soon...')
-        print(e)
-    return ERROR_CALLING_LLM, None, None
+    """Call multimodal LLM via AgentScope OpenAIChatModel."""
+    return _call_agentscope_openai(
+        text_prompt=text_prompt,
+        images=images,
+        model_name=self.model,
+        temperature=self.temperature,
+    )

@@ -31,11 +31,11 @@ from android_world import registry
 from android_world import suite_utils
 from android_world.agents import base_agent
 from android_world.agents import human_agent
-from android_world.agents import infer
 from android_world.agents import m3a
 from android_world.agents import random_agent
 from android_world.agents import seeact
 from android_world.agents import t3a
+from android_world.agents import infer
 from android_world.env import env_launcher
 from android_world.env import interface
 
@@ -129,6 +129,12 @@ _OUTPUT_PATH = flags.DEFINE_string(
 
 # Agent specific.
 _AGENT_NAME = flags.DEFINE_string('agent_name', 'm3a_gpt4v', help='Agent name.')
+_MODEL_BACKEND = flags.DEFINE_string(
+    'model_backend',
+    '',
+    'Model backend. Options: openai, dashscope, gemini.'
+    ' If empty, defaults to "openai".',
+)
 
 _FIXED_TASK_SEED = flags.DEFINE_boolean(
     'fixed_task_seed',
@@ -156,26 +162,28 @@ def _get_agent(
 ) -> base_agent.EnvironmentInteractingAgent:
   """Gets agent."""
   print('Initializing agent...')
+
+  model_backend = _MODEL_BACKEND.value or 'openai'
+
+  def _get_llm() -> infer.MultimodalLlmWrapper:
+    if model_backend == 'dashscope':
+      return infer.DashScopeWrapper()
+    elif model_backend == 'gemini':
+      return infer.GeminiGcpWrapper(
+          multimodal=True, model_name='gemini-1.5-pro-latest'
+      )
+    else:
+      return infer.Gpt4Wrapper('gpt-4-turbo-2024-04-09')
+
   agent = None
   if _AGENT_NAME.value == 'human_agent':
     agent = human_agent.HumanAgent(env)
   elif _AGENT_NAME.value == 'random_agent':
     agent = random_agent.RandomAgent(env)
-  # Gemini.
-  elif _AGENT_NAME.value == 'm3a_gemini_gcp':
-    agent = m3a.M3A(
-        env, infer.GeminiGcpWrapper(model_name='gemini-1.5-pro-latest')
-    )
-  elif _AGENT_NAME.value == 't3a_gemini_gcp':
-    agent = t3a.T3A(
-        env, infer.GeminiGcpWrapper(model_name='gemini-1.5-pro-latest')
-    )
-  # GPT.
-  elif _AGENT_NAME.value == 't3a_gpt4':
-    agent = t3a.T3A(env, infer.Gpt4Wrapper('gpt-4-turbo-2024-04-09'))
-  elif _AGENT_NAME.value == 'm3a_gpt4v':
-    agent = m3a.M3A(env, infer.Gpt4Wrapper('gpt-4-turbo-2024-04-09'))
-  # SeeAct.
+  elif _AGENT_NAME.value in ('m3a_gpt4v', 'm3a_gemini_gcp', 'm3a_dashscope'):
+    agent = m3a.M3A(env, _get_llm())
+  elif _AGENT_NAME.value in ('t3a_gpt4', 't3a_gemini_gcp', 't3a_dashscope'):
+    agent = t3a.T3A(env, _get_llm())
   elif _AGENT_NAME.value == 'seeact':
     agent = seeact.SeeAct(env)
 

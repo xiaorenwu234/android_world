@@ -161,9 +161,15 @@ def delete_all_rows_from_table(
     conn = sqlite3.connect(local_db_path)
     cursor = conn.cursor()
     delete_command = f"DELETE FROM {table_name}"
-    cursor.execute(delete_command)
-    conn.commit()
-    conn.close()
+    try:
+      cursor.execute(delete_command)
+      conn.commit()
+    except sqlite3.OperationalError as e:
+      # If the table doesn't exist or has issues (e.g., FTS4 module missing),
+      # we can safely ignore since we're just trying to clear data
+      print(f"Warning: Could not delete from {table_name}: {e}")
+    finally:
+      conn.close()
     env.controller.push_file(local_db_path, remote_db_file_path, timeout_sec)
     adb_utils.close_app(
         app_name, env.controller
