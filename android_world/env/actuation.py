@@ -17,12 +17,50 @@
 import copy
 import logging
 import time
-from typing import Any
+from typing import Any, Optional
 from android_env import env_interface
 from android_world.env import adb_utils
 from android_world.env import android_world_controller
 from android_world.env import json_action
 from android_world.env import representation_utils
+
+
+def _resolve_endpoint(
+    idx: Optional[int],
+    xy: Optional[tuple[int, int]],
+    screen_elements: list[Any],
+    screen_size: tuple[int, int],
+) -> Optional[tuple[int, int]]:
+  """Resolve a drag endpoint into absolute (x, y) screen coordinates.
+
+  Either an element index or an absolute (x, y) tuple may be provided.
+  Coordinates are clamped to the screen bounds.
+
+  Args:
+    idx: UI element index. Takes precedence over `xy` when not None.
+    xy: Absolute pixel coordinates.
+    screen_elements: List of UI elements on the screen.
+    screen_size: (width, height) of the screen.
+
+  Returns:
+    A clamped (x, y) tuple, or None if neither input is provided / valid.
+  """
+  if idx is not None:
+    if idx < 0 or idx >= len(screen_elements):
+      return None
+    bbox = screen_elements[idx].bbox_pixels
+    if bbox is None:
+      return None
+    return (
+        int((bbox.x_min + bbox.x_max) // 2),
+        int((bbox.y_min + bbox.y_max) // 2),
+    )
+  if xy is not None:
+    w, h = screen_size
+    x = max(0, min(int(w) - 1, int(xy[0])))
+    y = max(0, min(int(h) - 1, int(xy[1])))
+    return (x, y)
+  return None
 
 
 def execute_adb_action(
@@ -121,19 +159,23 @@ def execute_adb_action(
   elif action.action_type == 'press_keyboard':
     adb_utils.press_keyboard_generic(action.keycode, env)
   elif action.action_type == 'drag_and_drop':
-    if action.touch_xy is not None and action.lift_xy is not None:
+    start = _resolve_endpoint(
+        action.from_index, action.from_xy or action.touch_xy,
+        screen_elements, screen_size,
+    )
+    end = _resolve_endpoint(
+        action.to_index, action.to_xy or action.lift_xy,
+        screen_elements, screen_size,
+    )
+    if start is not None and end is not None:
       command = adb_utils.generate_drag_and_drop_command(
-          action.touch_xy[0],
-          action.touch_xy[1],
-          action.lift_xy[0],
-          action.lift_xy[1],
-          4000,
+          start[0], start[1], end[0], end[1], 1500,
       )
       adb_utils.issue_generic_request(command, env)
     else:
       logging.warning(
-          'Drag and drop action indicated, but no coordinates provided. No '
-          'action will be executed.'
+          'Drag and drop action indicated, but endpoint(s) missing or '
+          'invalid. No action will be executed.'
       )
   elif action.action_type == 'scroll':
 

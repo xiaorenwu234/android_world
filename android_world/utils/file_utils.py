@@ -115,20 +115,18 @@ def clear_directory(
   if not check_directory_exists(directory_path, env):
     return
 
-  # Check if the folder is empty
-  res = adb_utils.issue_generic_request(
-      ["shell", "ls", "-1", directory_path], env
+  # Use `find -mindepth 1 -delete` instead of `rm -r path/*` to avoid shell
+  # glob expansion failure when the directory is empty.  The glob pattern `*`
+  # is expanded by the Android shell: if no files match, the literal `*` is
+  # passed to `rm`, which returns a non-zero exit code even though there is
+  # nothing to delete.
+  adb_utils.check_ok(
+      adb_utils.issue_generic_request(
+          ["shell", "find", directory_path, "-mindepth", "1", "-delete"],
+          env,
+      ),
+      f"Failed to clear directory {directory_path}.",
   )
-  folder_contents = res.generic.output.decode().replace("\r", "").strip()
-
-  if folder_contents:
-    adb_utils.check_ok(
-        adb_utils.issue_generic_request(
-            ["shell", "rm", "-r", f"{directory_path}/*"],
-            env,
-        ),
-        f"Failed to clear directory {directory_path}.",
-    )
 
 
 def create_file(

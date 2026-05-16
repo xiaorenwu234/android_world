@@ -19,8 +19,38 @@ of the run.py module. A task can be specified, otherwise a random task is
 selected.
 """
 
-from collections.abc import Sequence
+# MUST set these BEFORE any gRPC imports to suppress fork-related debug logs
 import os
+import sys
+import logging as python_logging
+
+# Suppress gRPC fork-related logs at the C level
+os.environ['GRPC_VERBOSITY'] = 'ERROR'
+os.environ['GRPC_TRACE'] = 'none'
+os.environ['GLOG_minloglevel'] = '2'
+os.environ['GRPC_ENABLE_FORK_SUPPORT'] = '0'
+os.environ['GRPC_LOG_FORK'] = '0'
+
+# Filter out gRPC fork-related log messages from stderr
+class GRPLogFilter:
+    def __init__(self, stderr):
+        self.stderr = stderr
+        
+    def write(self, text):
+        if 'fork_posix.cc' in text or 'ev_poll_posix.cc' in text:
+            return  # Suppress gRPC fork-related logs
+        self.stderr.write(text)
+        
+    def flush(self):
+        self.stderr.flush()
+        
+    def fileno(self):
+        return self.stderr.fileno()
+
+# Apply the filter to stderr
+sys.stderr = GRPLogFilter(sys.stderr)
+
+from collections.abc import Sequence
 import random
 from typing import Type
 
@@ -34,9 +64,6 @@ from android_world.env import env_launcher
 from android_world.task_evals import task_eval
 
 logging.set_verbosity(logging.WARNING)
-
-os.environ['GRPC_VERBOSITY'] = 'ERROR'  # Only show errors
-os.environ['GRPC_TRACE'] = 'none'  # Disable tracing
 
 
 def _find_adb_directory() -> str:

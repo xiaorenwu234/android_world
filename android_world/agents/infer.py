@@ -297,7 +297,7 @@ class DashScopeWrapper(MultimodalLlmWrapper):
 
   def __init__(
       self,
-      model_name: str = 'qwen-vl-max',
+      model_name: str = 'qwen-vl-plus',
       temperature: float = 0.0,
   ):
     self.model_name = model_name

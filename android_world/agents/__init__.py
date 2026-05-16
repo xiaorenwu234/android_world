@@ -13,3 +13,7 @@
 # limitations under the License.
 
 """Agents package for AndroidWorld."""
+
+from android_world.agents.pipeline_m3a import PipelineM3A
+
+__all__ = ['PipelineM3A']

@@ -20,8 +20,38 @@ tasks or all tasks in the suite and customize various settings using the
 command-line flags.
 """
 
-from collections.abc import Sequence
+# MUST set these BEFORE any gRPC imports to suppress fork-related debug logs
 import os
+import sys
+import logging as python_logging
+
+# Suppress gRPC fork-related logs at the C level
+os.environ['GRPC_VERBOSITY'] = 'ERROR'
+os.environ['GRPC_TRACE'] = 'none'
+os.environ['GLOG_minloglevel'] = '2'
+os.environ['GRPC_ENABLE_FORK_SUPPORT'] = '0'
+os.environ['GRPC_LOG_FORK'] = '0'
+
+# Filter out gRPC fork-related log messages from stderr
+class GRPLogFilter:
+    def __init__(self, stderr):
+        self.stderr = stderr
+        
+    def write(self, text):
+        if 'fork_posix.cc' in text or 'ev_poll_posix.cc' in text:
+            return  # Suppress gRPC fork-related logs
+        self.stderr.write(text)
+        
+    def flush(self):
+        self.stderr.flush()
+        
+    def fileno(self):
+        return self.stderr.fileno()
+
+# Apply the filter to stderr
+sys.stderr = GRPLogFilter(sys.stderr)
+
+from collections.abc import Sequence
 
 from absl import app
 from absl import flags
@@ -32,6 +62,7 @@ from android_world import suite_utils
 from android_world.agents import base_agent
 from android_world.agents import human_agent
 from android_world.agents import m3a
+from android_world.agents import pipeline_m3a
 from android_world.agents import random_agent
 from android_world.agents import seeact
 from android_world.agents import t3a
@@ -40,9 +71,6 @@ from android_world.env import env_launcher
 from android_world.env import interface
 
 logging.set_verbosity(logging.WARNING)
-
-os.environ['GRPC_VERBOSITY'] = 'ERROR'  # Only show errors
-os.environ['GRPC_TRACE'] = 'none'  # Disable tracing
 
 
 def _find_adb_directory() -> str:
@@ -132,8 +160,43 @@ _AGENT_NAME = flags.DEFINE_string('agent_name', 'm3a_gpt4v', help='Agent name.')
 _MODEL_BACKEND = flags.DEFINE_string(
     'model_backend',
     '',
-    'Model backend. Options: openai, dashscope, gemini.'
-    ' If empty, defaults to "openai".',
+    'Model backend for the agent (or for Stage 1 / perception of PipelineM3A).'
+    ' Options: openai, dashscope, gemini. If empty, defaults to "openai".',
+)
+_REASONING_MODEL_BACKEND = flags.DEFINE_string(
+    'reasoning_model_backend',
+    '',
+    'Model backend for Stage 2 (reasoning) of PipelineM3A.'
+    ' Options: openai, dashscope, gemini.'
+    ' If empty, falls back to --model_backend.',
+)
+_TRANSLATION_MODEL_BACKEND = flags.DEFINE_string(
+    'translation_model_backend',
+    '',
+    'Model backend for Stage 3 (translation) of PipelineM3A.'
+    ' Options: openai, dashscope, gemini.'
+    ' If empty, falls back to --model_backend.',
+)
+_PERCEPTION_MODEL_NAME = flags.DEFINE_string(
+    'perception_model_name',
+    '',
+    'Model name for Stage 1 (perception) of PipelineM3A. Only used when'
+    ' the perception backend is dashscope. Must be vision-capable.'
+    ' Defaults to qwen-vl-plus.',
+)
+_REASONING_MODEL_NAME = flags.DEFINE_string(
+    'reasoning_model_name',
+    '',
+    'Model name for Stage 2 (reasoning) of PipelineM3A. Only used when'
+    ' the reasoning backend is dashscope. A text model (e.g. qwen-plus)'
+    ' is sufficient. Defaults to qwen-plus.',
+)
+_TRANSLATION_MODEL_NAME = flags.DEFINE_string(
+    'translation_model_name',
+    '',
+    'Model name for Stage 3 (translation) of PipelineM3A. Only used when'
+    ' the translation backend is dashscope. A text model (e.g. qwen-plus)'
+    ' is sufficient. Defaults to qwen-plus.',
 )
 
 _FIXED_TASK_SEED = flags.DEFINE_boolean(
@@ -165,10 +228,16 @@ def _get_agent(
 
   model_backend = _MODEL_BACKEND.value or 'openai'
 
-  def _get_llm() -> infer.MultimodalLlmWrapper:
-    if model_backend == 'dashscope':
+  def _get_llm(
+      backend: str | None = None,
+      model_name: str | None = None,
+  ) -> infer.MultimodalLlmWrapper:
+    b = backend or model_backend
+    if b == 'dashscope':
+      if model_name:
+        return infer.DashScopeWrapper(model_name=model_name)
       return infer.DashScopeWrapper()
-    elif model_backend == 'gemini':
+    elif b == 'gemini':
       return infer.GeminiGcpWrapper(
           multimodal=True, model_name='gemini-1.5-pro-latest'
       )
@@ -186,12 +255,41 @@ def _get_agent(
     agent = t3a.T3A(env, _get_llm())
   elif _AGENT_NAME.value == 'seeact':
     agent = seeact.SeeAct(env)
+  elif _AGENT_NAME.value == 'pipeline_m3a':
+    perception_backend = model_backend
+    reasoning_backend = _REASONING_MODEL_BACKEND.value or model_backend
+    translation_backend = _TRANSLATION_MODEL_BACKEND.value or model_backend
+
+    # For dashscope, use the recommended vision/text split by default:
+    # perception=qwen-vl-plus, reasoning/translation=qwen-plus. Override
+    # via --perception_model_name / --reasoning_model_name /
+    # --translation_model_name. Other backends keep their existing
+    # single-model behavior.
+    perception_model_name = _PERCEPTION_MODEL_NAME.value or (
+        'qwen-vl-plus' if perception_backend == 'dashscope' else None
+    )
+    reasoning_model_name = _REASONING_MODEL_NAME.value or (
+        'qwen-plus' if reasoning_backend == 'dashscope' else None
+    )
+    translation_model_name = _TRANSLATION_MODEL_NAME.value or (
+        'qwen-plus' if translation_backend == 'dashscope' else None
+    )
+
+    perception_llm = _get_llm(perception_backend, perception_model_name)
+    reasoning_llm = _get_llm(reasoning_backend, reasoning_model_name)
+    translation_llm = _get_llm(translation_backend, translation_model_name)
+    agent = pipeline_m3a.PipelineM3A(
+        env,
+        perception_llm=perception_llm,
+        reasoning_llm=reasoning_llm,
+        translation_llm=translation_llm,
+    )
 
   if not agent:
     raise ValueError(f'Unknown agent: {_AGENT_NAME.value}')
 
   if (
-      agent.name in ['M3A', 'T3A', 'SeeAct']
+      agent.name in ['M3A', 'T3A', 'SeeAct', 'PipelineM3A']
       and family
       and family.startswith('miniwob')
       and hasattr(agent, 'set_task_guidelines')

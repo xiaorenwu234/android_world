@@ -678,6 +678,22 @@ def _launch_default_app(
   return response
 
 
+# Common app name aliases that agents might use, mapped to canonical names
+_APP_NAME_ALIASES = {
+    'file manager': 'files',
+    'files app': 'files',
+    'file explorer': 'files',
+    'my files': 'files',
+    'phone': 'dialer',
+    'dialer': 'dialer',
+    'calculator': 'calculator',
+    'calendar': 'simple calendar pro',
+    'messages': 'messages',
+    'sms': 'simple sms messenger',
+    'messenger': 'simple sms messenger',
+}
+
+
 def launch_app(
     app_name: str,
     env: env_interface.AndroidEnvInterface,
@@ -692,6 +708,12 @@ def launch_app(
   Returns:
     The name of the app that is launched.
   """
+  
+  # Try to resolve app name alias first
+  normalized_name = app_name.lower().strip()
+  if normalized_name in _APP_NAME_ALIASES:
+    app_name = _APP_NAME_ALIASES[normalized_name]
+    logging.info('Resolved app name alias: %r -> %r', app_name, app_name)
 
   if app_name in _DEFAULT_URIS:
     _launch_default_app(app_name, env)
@@ -700,8 +722,10 @@ def launch_app(
   activity = get_adb_activity(app_name)
   if activity is None:
     #  If the app name is not in the mapping, assume it is a package name.
+    # Escape app_name if it contains spaces to prevent shell parsing issues
+    escaped_app_name = f"'{app_name}'" if ' ' in app_name else app_name
     response = issue_generic_request(
-        ['shell', 'monkey', '-p', app_name, '1'], env, timeout_sec=5
+        ['shell', 'monkey', '-p', escaped_app_name, '1'], env, timeout_sec=5
     )
     logging.info('Launching app by package name, response: %r', response)
     return app_name
